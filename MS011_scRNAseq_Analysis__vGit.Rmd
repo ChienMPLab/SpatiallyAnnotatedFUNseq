@@ -1,0 +1,989 @@
+---
+title: "MPChien Lab scRNAseq pipeline code | scRNAseq analysis"
+author: "Kate J. Feller; modified by Myrthe Smit"
+output:
+  html_document:
+    highlight: pygments
+    df_print: paged
+    toc: yes
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+# Erase everything in the global environment
+# It is a good habit to start with a clean slate
+rm(list = ls())
+
+# Set the knitr options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  error = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = TRUE,
+  results = "hold",
+  fig.keep = "all",
+  fig.show = "hold",
+  comment = NA
+)
+```
+
+<span style="color:#cd6155;">**Libraries**</span> <br>
+The MP Chien scRNAseq pipeline is build around the [Seurat package](https://satijalab.org/) standard scRNAseq analysis pipeline.
+```{r libraries}
+# Seurat library
+library(Seurat)
+
+# General libraries
+library(data.table)
+library(EnhancedVolcano)
+library(future)
+library(ggrepel)
+library(patchwork)
+library(presto)
+library(readxl)
+library(tidyverse)
+library(viridis)
+
+# The amount of CPU cores to use
+plan("multiprocess", workers = 5)
+# Specify the amount of memory (RAM) to use in mb
+MEMORY = 700
+options(future.globals.maxSize = MEMORY*(1024^2))
+
+rm(MEMORY)
+```
+
+# The Experimental Information
+<span style="color:#cd6155;">**scRNAseq_analysis_code version**</span> v5.1
+
+<span style="color:#cd6155;">**Experimental Code**</span> <br>
+MS_SpatialTranscriptomics
+
+<span style="color:#cd6155;">**Description of the wet lab experiment and the data**</span> <br>
+In this experiment we seeded a patch of MCF10A cells and let them grow for 6 days. Then we phototagged cells with two different phototagging dyes to get 3 regions: the outside ring of the clump, the middle ring of the clump and the center. In one set-up, we made equally-sized rings and in the other set-up we made rings with width 250 um. 
+
+<span style="color:#cd6155;">**Goal of this analysis **</span> <br>
+Test if the cells at the edge have a higher level of EMT than cells in the center.
+
+<span style="color:#cd6155;">**Sample description**</span> <br>
+```{r experiments, echo=FALSE}
+# Read in the Excel file with the sample information
+sampleinformation <- read_excel("2_scData/SampleOverview.xlsx")
+
+# Format the table
+formattable::formattable(sampleinformation, align = c("l"))
+rm(sampleinformation)
+```
+
+# The Basis | Directories and Data
+## Directories and project name
+Here we specify where to read and save the data and generated outputs to.
+```{r}
+# Where to read the scRNAseq data from
+dataDirectory <- "2_scData/"
+# Save the significant markers to this directory
+genesDirectory <- "3_GenesofInterest/"
+gseaDirectory <- "4_GSEA/"
+imageDirectory <- "_Figures"
+
+# These names will be used in file saving and loading
+PROJECTNAME <- "MS011"
+# PROJECTNAME <- "MS_SpatialTranscriptomics"
+ANALYSISNAME <- "edge" 
+```
+
+## Importing the data
+As we already created the Seurat object in the `MS011_scRNAseq_SeuratObject__vGit.Rmd` code, we can just directly import it here.
+```{r}
+beforeQC_object <- readRDS(file = paste0(dataDirectory, PROJECTNAME, "_BeforeQC.rds"))
+
+# load corrected object if you already did QC before
+# corrected_object <- readRDS(file = paste0(dataDirectory, PROJECTNAME, "_", ANALYSISNAME, "_CorrectedObject.rds"))
+```
+
+It is handy if the plots have the same color scheme.
+```{r}
+colorpalette <- viridis_pal(option = "magma")(12)
+# scales::show_col(colorpalette)
+
+# Color by populations
+colorbytreatment <- list("inner" = colorpalette[[11]], "middle" = colorpalette[[8]], "outer" = colorpalette[[3]])
+```
+
+# Data Quality Control (QC) | Filtering out low quality cells
+**The goal of QC is** to filter out cells that are considered low quality cells &#8594; cells that have erroneous transcript counts. If these cells are not filtered out, it will impact the downstream analyses and can result in misinterpretation of the data. 
+
+<details>
+  <summary> The QC metrics explanation </summary>
+The Seurat library automatically calculates two measures that can help us in identifying these cells: <br>
+- `nFeature_RNA` &#8594; the number of genes that were measured per cell <br>
+- `ncount_RNA` &#8594; the total number of molecules detected within a cell; UMI counts <br>
+
+Additional measures we can calculate are: <br>
+- `percent_MT` &#8594; the amount of mitochondrial RNA in a cell <br>
+- `percent_RIBO` &#8594; the amount of rRNA in a cell <br>
+
+If `nFeature_RNA` is too low it could indicate an empty well/droplet or a dead/dying cell. If `nFeature_RNA` and/or `ncount_RNA` are too high, this could be the indication of multiple cells (doublets) in a droplet/well. Low quality cells have been associated with a high(er) percentage of mitochondrial genes measured. In depth explanation about the interpretation can be found in this paper &#8594; <small>Ilicic, T. et al. Classification of low quality cells from single-cell RNA-seq data. Genome Biol 17, (2016). </small>
+</details>
+
+## Calculate the mitochondrial and ribosomial RNA percentage
+```{r}
+# Use all genes starting with MT-
+beforeQC_object[["percentMT"]] <- PercentageFeatureSet(beforeQC_object, pattern = "^MT-")
+# Use all genes starting with "RPS" or "RPL"
+beforeQC_object[["percentRIBO"]] <- PercentageFeatureSet(beforeQC_object, pattern = "^RP[SL]")
+```
+
+## Plot the QC plots and determine the QC cutoffs {.tabset .tabset-fade .tabset-pills}
+Based on the QC plots we will decide where to place the cutoffs for low quality cells. Generally speaking, we decide the cutoffs based on two parameters &#8594; `percentMT` and `nFeature_RNA`. By iteratively changing these cutoffs and looking at the distribution of cells that are filtered out, you can decide the final cutoffs. In some cases, individual samples may require different cutoffs. It is important to not consider each of these QC measures by themselves as that may result in a warped view of the data.
+
+```{r}
+MT_cutoff <- 40  #differs between sample types
+nFeature_cutoff <- c(2000, 9000)
+```
+
+### Individual plots
+```{r fig.width=7, fig.height=7}
+plotQCs <- function(data, column) {
+  # Function to plot the QC plots
+  # Input: a dataframe with data extracted from the Seurat object and the column of interest to plot
+  # Output: ggplots
+
+  output <- ggplot(data, aes_string(x = "batch", y = column, fill = "sample")) +
+    geom_violin() +
+    labs(x = "Batch ID") +
+    scale_fill_manual(values = c(colorpalette[[11]], colorpalette[[8]], colorpalette[[3]]))
+  return(output)
+}
+
+# PLOTTING -----------------------------------------------------------------------------------------
+# How deep was the sample sequenced?
+EXPECTED_nREADS <- 150000
+
+# only plot the values for the equal/edge tagging approach
+# QC_plot_object <- subset(beforeQC_object, batch == c(136,137,138,139))
+
+# Extract the data we need for the plot from the Seurat object
+metadata <- beforeQC_object@meta.data %>%
+  rename(
+    number_UMIs = nCount_RNA,
+    number_Genes = nFeature_RNA
+  )
+metadata$batch <- as.factor(metadata$batch)
+
+metadata$UMIperFeature <- log10(metadata$number_UMIs) / log10(metadata$number_Genes)
+avg_nUMI <- mean(metadata$number_UMIs)
+
+
+# Plot
+qc1 <- plotQCs(data = metadata, column = "number_Genes") +
+  geom_hline(yintercept = nFeature_cutoff[1], linetype = "dashed", color = "red") +
+  geom_hline(yintercept = nFeature_cutoff[2], linetype = "dashed", color = "red") +
+  labs(y = "nFeature_RNA") +
+  theme_classic()
+qc2 <- plotQCs(data = metadata, column = "number_UMIs") +
+  geom_hline(yintercept = avg_nUMI, linetype = "dashed", color = "blue") +
+  labs(y = "nCount_RNA") +
+  theme_classic()
+qc3 <- plotQCs(data = metadata, column = "percentMT") +
+  geom_hline(yintercept = MT_cutoff, linetype = "dashed", color = "red") +
+  theme_classic()
+qc4 <- plotQCs(data = metadata, column = "percentRIBO") +
+  theme_classic()
+
+qc2 + qc1 + qc3 + plot_layout(ncol = 1, guides = "collect")
+
+# ggsave(
+#     filename = paste0(PROJECTNAME, "_QC_plots", ".pdf"),
+#     plot = qc2 + qc1 + qc3 + plot_layout(ncol = 1, guides = "collect") ,
+#     path = imageDirectory,
+#     width = 7,
+#     height = 7,
+#     #units = "in",
+#   )
+
+rm(qc1, qc2, qc3, qc4, EXPECTED_nREADS)
+```
+
+### Relationship between QC methods
+```{r fig.width=20, fig.height=20}
+combinedQCplots <- list()
+
+for (i in unique(metadata$sample)) {
+  plotdata <- metadata %>%
+    filter(sample == i)
+
+  combinedQCplots[[i]] <- ggplot(plotdata, aes_string(x = "number_UMIs", y = "number_Genes", color = "percentMT")) +
+    geom_point() +
+    geom_hline(yintercept = nFeature_cutoff[1], linetype = "dashed", color = "red") +
+    geom_hline(yintercept = nFeature_cutoff[2], linetype = "dashed", color = "red") +
+    ggtitle(paste(i, sep = " ")) +
+    scale_color_viridis(limits = c(0, 100), option = "H") +
+    scale_y_continuous(breaks = seq(0, 20000, by = 2000)) +
+    xlim(0, 200000) +
+    ylim(0, 12000)
+}
+
+wrap_plots(c(combinedQCplots)) + plot_layout(ncol = 2)
+
+rm(i, plotdata, combinedQCplots)
+```
+
+## Clean the data
+```{r}
+afterQC_object <- subset(
+  beforeQC_object,
+  subset = nFeature_RNA > nFeature_cutoff[1] &
+    nFeature_RNA < nFeature_cutoff[2] &
+    percentMT < MT_cutoff
+)
+```
+
+<div class = "row">
+<div class = "col-md-6">
+Summarize the data **before filtering**
+```{r rows.print=15}
+table(beforeQC_object@meta.data$sample)
+
+beforeQC_object@meta.data %>%
+  group_by(batch, treatment) %>%
+  summarise(
+    count = n(),
+    mean_genes = mean(nFeature_RNA)
+  )
+```
+
+</div>
+<div class = "col-md-6">
+Summarize the data **after filtering**
+```{r rows.print=15}
+table(afterQC_object@meta.data$sample)
+
+afterQC_object@meta.data %>%
+  group_by(batch, treatment) %>%
+  summarise(
+    count = n(),
+    mean_genes = mean(nFeature_RNA)
+  )
+```
+
+</div>
+</div>
+
+# Data QC | Removing technical variation {.tabset .tabset-fade .tabset-pills}
+<details>
+  <summary>Overview of the steps</summary>
+<span style="color:#cd6155;">**Normalization**</span> &#8594; Normalization addresses/corrects the inherent variance introduced by the scRNAseq methods in order to obtain the correct relative gene expression. Seurat's method `NormalizeData` is a global-scaling normalization where the UMI counts of each cell are first scaled by the total sequencing depth (size factors) followed by pseudocount addition and log-transformation. A new(er) implementation of normalization in Seurat (`SCTransform`) is based on the negative binomial distribution and uses kernel regression to prevent overfitting of the data &#8594; <small> Hafemeister, C. & Satija, R. Normalization and variance stabilization of single-cell RNA-seq data using regularized negative binomial regression. Genome Biol 20, 296 (2019). </small>
+
+More information about `SCTransform` can be found in the Seurat [SCTransform Vignette](https://satijalab.org/seurat/archive/v3.0/sctransform_vignette.html)
+
+<span style="color:#cd6155;">**Identification of Highly Variable Features**</span> &#8594; Using the `FindVariableFeatures` method, it is possible to identify features (= genes) that show a high cell-to-cell variation. These genes are considered the most "informative" part of the data set.
+
+<span style="color:#cd6155;">**Scaling**</span> &#8594; Traditionally, scaling does two things (i) shifts the mean expression across cells to zero and (ii) scales the variance so it equals one (1) across cells. The application of scaling on RNAseq data is HIGHLY debated and it is still unclear on whether or not it should be applied. However, methods like PCA work better on scaled data and the benefit of using a Seurat object is that the scaled data is stored separately from the original data and therefore methods that need scaled data will be able to access the data they need without changing the entire data structure.
+
+<span style="color:#cd6155;">**Correcting Biological influences**</span> &#8594; Some biological processes play a major role on gene expression and can obscure the biological signal of interest. The most common influence to correct for is the **cell cycle**. Seurat provides a `txt` file with the cell cycle genes used for correction.
+```{r}
+### CELL CYCLE MARKERS
+CCmarkers <- readLines(con = "regev_lab_cell_cycle_genes.txt")
+## We can divide this list in both the S phase and G2/M phase
+Sgenes <- CCmarkers[1:43]
+G2Mgenes <- CCmarkers[44:97]
+
+## Note: These genes can also be read from Seurat itself
+# Sgenes <- cc.genes$s.genes
+# G2Mgenes <- cc.genes$g2m.genes
+```
+</details>
+
+## Splitting and/or subsetting the Seurat object
+One step in this analysis is deciding if you want to analyze different samples separately and if you only want to analyze specific batches (maybe due to sequencing differences).
+
+```{r}
+### COMMENT OUT what isn't needed. Setting to NONE or FALSE will NOT WORK!!!
+SUBSET_BATCH <- c(138, 139) # which plate (= batch) to use
+# SPLIT_SEURAT_BY <- "sample"
+
+# Subset the data set
+if (exists("SUBSET_BATCH")) {
+  print(paste("Only the following batches are being analyzed:",
+    paste(SUBSET_BATCH, collapse = " | "),
+    sep = " "
+  ))
+  subset_object <- subset(afterQC_object, subset = batch %in% SUBSET_BATCH)
+} else {
+  print("The entire dataset is being analyzed")
+  subset_object <- afterQC_object
+}
+
+# Split the object by samples
+if (exists("SPLIT_SEURAT_BY")) {
+  print(paste("The object will be split by:",
+    paste(SPLIT_SEURAT_BY, collapse = " | "),
+    sep = " "
+  ))
+  Idents(subset_object) <- subset_object@meta.data[[SPLIT_SEURAT_BY]]
+  sample_objects <- SplitObject(subset_object, split.by = SPLIT_SEURAT_BY)
+} else {
+  print("Sample object is unchanged")
+  sample_objects <- list(subset_object)
+  names(sample_objects) <- PROJECTNAME # only comment in if you do NOT split by batch or sample
+}
+
+rm(subset_object)
+```
+
+## Before cell cycle and batch correction
+<details>
+  <summary>Functions for normalization and CC correction</summary>
+```{r}
+# Preprocessing ------------------------------------------------------------------------------------
+performPreprocessing <- function(seuratdata, PERFORMCELLCYCLECORRECTION = FALSE) {
+  # Function to perform pre-processing on the data
+  # Input is a list of Seurat objects (seuratdata) and whether or not to perform Cell Cycle Correction
+  # Output is a list of Seurat objects
+
+  seuratdata <- lapply(X = seuratdata, FUN = function(x) {
+    x <- NormalizeData(x, verbose = FALSE)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+    x <- CellCycleScoring(x, s.features = Sgenes, g2m.features = G2Mgenes, set.ident = TRUE)
+  })
+
+  for (i in names(seuratdata)) {
+    # Cell Cycle difference
+    seuratdata[[i]]$CCDifference <- seuratdata[[i]]$S.Score - seuratdata[[i]]$G2M.Score
+
+    # 4. Perform scaling
+    if (isTRUE(PERFORMCELLCYCLECORRECTION)) {
+      # if you want to perform Cell Cycle Correction
+      seuratdata[[i]] <- ScaleData(seuratdata[[i]],
+        vars.to.regress = "CCDifference",
+        features = rownames(seuratdata[[i]]),
+        verbose = FALSE
+      )
+      seuratdata[[i]] <- SCTransform(seuratdata[[i]],
+        vars.to.regress = c("CCDifference"),
+        verbose = FALSE
+      )
+    } else {
+      # if you don't want to perform Cell Cycle Correction
+      seuratdata[[i]] <- ScaleData(seuratdata[[i]],
+        features = rownames(seuratdata[[i]]),
+        verbose = FALSE
+      )
+      seuratdata[[i]] <- SCTransform(seuratdata[[i]],
+        verbose = FALSE
+      )
+    }
+  }
+  return(seuratdata)
+}
+
+
+# PLOTTING -----------------------------------------------------------------------------------------
+plotPreprocessingPlots <- function(seuratdata) {
+  # Function to plot the technical variation plots
+  # Input is a Seurat object
+
+  # Lists for the plots
+  cellcycleplot <- list()
+  batcheffectplot <- list()
+
+  for (i in names(seuratdata)) {
+    # Plot the Cell Cycle influence
+    cellcycleplot[[i]] <- DimPlot(RunPCA(seuratdata[[i]],
+      features = c(Sgenes, G2Mgenes,
+        verbose = FALSE
+      )
+    )) +
+      theme(
+        plot.title = element_text(size = 10, hjust = 0.5),
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 8),
+        legend.text = element_text(size = 8)
+      ) +
+      scale_color_manual(breaks = c("S", "G1", "G2M"), values = viridis_pal()(3)) +
+      ggtitle(paste("Cell Cycle Influence", i, sep = " "))
+
+    # Plot the Batch influence
+    batcheffectplot[[i]] <- DimPlot(RunPCA(seuratdata[[i]],
+      verbose = FALSE
+    ),
+    group.by = "batch"
+    ) +
+      theme(
+        plot.title = element_text(size = 10, hjust = 0.5),
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 8)
+      ) +
+      ggtitle(paste("Batch influence", i, sep = " "))
+  }
+  return(wrap_plots(c(cellcycleplot, batcheffectplot)) + plot_layout(ncol = 2))
+}
+```
+</details>
+
+```{r fig.width=6, fig.height=3}
+beforeCorrections_object <- performPreprocessing(
+  sample_objects,
+  PERFORMCELLCYCLECORRECTION = F
+)
+
+plotPreprocessingPlots(beforeCorrections_object)
+```
+
+## Only Cell Cycle correction
+```{r fig.width=6, fig.height=3}
+afterCC_Corrections_object <- performPreprocessing(
+  sample_objects,
+  PERFORMCELLCYCLECORRECTION = T
+)
+
+plotPreprocessingPlots(afterCC_Corrections_object)
+```
+
+## The dataset we will continue with
+```{r}
+if (exists("afterCC_Corrections_object")) {
+  print("The Cell Cycle corrected data will be used")
+  corrected_object <- afterCC_Corrections_object
+  rm(beforeCorrections_object)
+} else {
+  corrected_object <- beforeCorrections_object
+}
+
+rm(sample_objects)
+```
+
+# Dimensionality Reduction and Visualization
+## PCA
+To determine the dimensionality of the data, we start by performing a PCA. First, check the default assays which should be `SCT`
+```{r}
+lapply(X = corrected_object, FUN = function(x) {x <- DefaultAssay(object = x)})
+```
+
+```{r fig.width=3, fig.height=3}
+# Prepare the plots
+pca_axis <- c(-50, 50)
+pcaPlots <- list()
+
+for (i in names(corrected_object)) {
+  # Run the PCA
+  corrected_object[[i]] <- RunPCA(corrected_object[[i]],
+    features = VariableFeatures(object = corrected_object[[i]]),
+    verbose = FALSE,
+    npcs = 60
+  )
+
+  # Plot the PCA results
+  pcaPlots[[i]] <- DimPlot(corrected_object[[i]], reduction = "pca", group.by = "treatment", cols = colorbytreatment) +
+    ggtitle(paste("PCA", i, sep = " ")) +
+    theme(
+      plot.title = element_text(size = 10, hjust = 0.5),
+      axis.title = element_text(size = 8),
+      axis.text = element_text(size = 8),
+      legend.text = element_text(size = 8)
+    ) +
+    xlim(pca_axis) +
+    ylim(pca_axis)
+}
+
+wrap_plots(pcaPlots) + plot_layout(guides = "collect")
+
+rm(pcaPlots, i)
+```
+
+## Determine the number of Principle Components to use for the downstream analysis
+To make sure we do not accidentally exclude relevant information, its better to err on the side of caution and incorporate more PCs. There are two method implemented in Seurat `JackStraw`, which is computationally intensive and does NOT work on SCTransform output, and the more common `ElbowPlot`. However, Seurat's guidelines for `SCTransform` are slightly different:
+
+<blockquote>
+  <p> Even after standard log-normalization, variation in sequencing depth is still a confounding factor (see Figure 1), and this effect can subtly influence higher PCs. In sctransform, this effect is substantially mitigated (see Figure 3). This means that higher PCs are more likely to represent subtle, but biologically relevant, sources of heterogeneity – so including them may improve downstream analysis.</p>
+  <p> <small> [source](https://satijalab.org/seurat/articles/sctransform_vignette.html) </small></p>
+</blockquote>
+
+### Elbow plot
+```{r fig.width=3, fig.height=3}
+DIMS <- 50
+
+for (i in names(corrected_object)) {
+  print(ElbowPlot(corrected_object[[i]], ndims = DIMS, reduction = "pca") +
+    ggtitle(paste("Elbow", i, sep = " ")) +
+    theme(
+      plot.title = element_text(size = 10, hjust = 0.5),
+      axis.title = element_text(size = 8),
+      axis.text = element_text(size = 8),
+      legend.text = element_text(size = 8)
+    ))
+}
+
+rm(i, DIMS)
+```
+
+## Cluster and Perform Dimensionality Reduction
+It might be a good idea to play around with the `resolution` parameter to achieve better clustering
+```{r}
+PCA_DIMENSIONS <- 40
+
+for (i in names(corrected_object)) {
+  # 1. Cluster
+  corrected_object[[i]] <- FindNeighbors(corrected_object[[i]],
+    dims = 1:PCA_DIMENSIONS,
+    verbose = FALSE
+  )
+
+  corrected_object[[i]] <- FindClusters(corrected_object[[i]],
+    resolution = 0.25,
+    verbose = FALSE
+  )
+
+  # 2. Dimension Reduction
+  corrected_object[[i]] <- RunUMAP(corrected_object[[i]],
+    dims = 1:PCA_DIMENSIONS,
+    reduction = "pca",
+    verbose = FALSE
+  )
+  corrected_object[[i]] <- RunTSNE(corrected_object[[i]],
+    dims = 1:PCA_DIMENSIONS,
+    reduction = "pca"
+  )
+}
+
+rm(i, PCA_DIMENSIONS)
+```
+
+## Visualize the Dimensionality Reduction {.tabset .tabset-fade .tabset-pills}
+### UMAP | Populations
+```{r fig.width=3, fig.height=2.9}
+umap_axis <- c(-7, 7)
+tsne_axis <- c(-30, 30)
+
+# Plot the treatment effect
+umapPlots <- list()
+tsnePlots <- list()
+
+# subset(x = corrected_object[[i]], subset = treatment == "inner" | treatment == "outer")
+for (i in names(corrected_object)) {
+  umapPlots[[i]] <- DimPlot(corrected_object[[i]], reduction = "umap", group.by = "treatment", cols = colorbytreatment, pt.size = 0.07) +
+    # labs(title = paste(i, sep = " ")) +
+    theme( # plot.title = element_text(size = 14, hjust = 0.5),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      legend.text = element_text(size = 12),
+      legend.position = "none"
+    ) +
+    coord_cartesian(xlim = umap_axis, ylim = umap_axis)
+
+  # ggsave(
+  #   filename = paste0(PROJECTNAME, "_", ANALYSISNAME, "_UMAP", ".pdf"),
+  #   plot = umapPlots[[i]],
+  #   path = imageDirectory,
+  #   dpi = 300,
+  #   width = 3,
+  #   height = 3,
+  #   #units = "in",
+  # )
+}
+
+# for (i in names(corrected_object)){
+#   tsnePlots[[i]] <- DimPlot(subset(x = corrected_object[[i]], subset = treatment == "inner" | treatment == "outer"), reduction = "tsne", group.by = "treatment", cols = colorbytreatment) +
+#     labs(title = paste(i, sep = " ")) +
+#     theme(plot.title = element_text(size = 28, hjust = 0.5),
+#           axis.title = element_text(size = 28),
+#           axis.text = element_text(size = 24),
+#           legend.text = element_text(size = 28),
+#           legend.position = "none" ) +
+#     coord_cartesian(xlim = tsne_axis, ylim = tsne_axis )
+#
+#   ggsave(
+#     filename = paste0(PROJECTNAME,"_", ANALYSISNAME, "_tSNE", "_", i,".pdf"),
+#     plot = tsnePlots[[i]],
+#     path = imageDirectory,
+#     dpi = 300,
+#     #width = 9,
+#     #height = 7,
+#     #units = "in",
+#   )
+#
+# }
+
+wrap_plots(umapPlots) + plot_layout(ncol = 1, guides = "collect")
+# wrap_plots(tsnePlots) + plot_layout(ncol = 4, guides = "collect")
+
+rm(umapPlots, tsnePlots, i)
+```
+
+### UMAP | Batch effect
+```{r fig.width=16, fig.height=4}
+# umap_axis <- c(-10,10)
+#
+# # Plot the treatment effect
+# umapPlots <- list()
+#
+# for (i in names(corrected_object)){
+#   umapPlots[[i]] <- DimPlot(corrected_object[[i]], reduction = "umap", group.by = "batch") +
+#     labs(title = paste(i, sep = " ")) +
+#     scale_color_manual(values = viridis_pal()(10)) +
+#     theme(plot.title = element_text(size = 10, hjust = 0.5),
+#           axis.title = element_text(size = 8),
+#           axis.text = element_text(size = 8),
+#           legend.text = element_text(size = 8)) +
+#     xlim(umap_axis) +
+#     ylim(umap_axis)
+# }
+#
+# wrap_plots(umapPlots) + plot_layout(ncol = 4, guides = "collect")
+#
+# rm(umapPlots, i)
+```
+
+### UMAP | Seurat Clusters
+```{r fig.width=2, fig.height=2}
+umapPlots <- list()
+tsnePlots <- list()
+
+for (i in names(corrected_object)) {
+  umapPlots[[i]] <- DimPlot(corrected_object[[i]], reduction = "umap", group.by = "seurat_clusters") +
+    ggtitle(paste("Seurat clusters |", i, sep = " ")) +
+    theme(
+      plot.title = element_text(size = 10, hjust = 0.5),
+      axis.title = element_text(size = 8),
+      axis.text = element_text(size = 8),
+      legend.text = element_text(size = 8)
+    ) +
+    xlim(umap_axis) +
+    ylim(umap_axis) +
+    scale_color_manual(values = viridis_pal(option = "H")(5))
+}
+
+for (i in names(corrected_object)) {
+  tsnePlots[[i]] <- DimPlot(corrected_object[[i]], reduction = "tsne", group.by = "seurat_clusters") +
+    ggtitle(paste("Seurat clusters |", i, sep = " ")) +
+    theme(
+      plot.title = element_text(size = 10, hjust = 0.5),
+      axis.title = element_text(size = 8),
+      axis.text = element_text(size = 8),
+      legend.text = element_text(size = 8)
+    ) +
+    xlim(tsne_axis) +
+    ylim(tsne_axis) +
+    scale_color_manual(values = viridis_pal(option = "H")(5))
+}
+
+wrap_plots(umapPlots) + plot_layout(ncol = 1)
+wrap_plots(tsnePlots) + plot_layout(ncol = 1)
+
+
+rm(umapPlots, tsnePlots, i)
+```
+
+```{r fig.width=2, fig.height=2}
+clustercountsplots <- list()
+
+for (i in names(corrected_object)) {
+  clustercountsplots[[i]] <- corrected_object[[i]]@meta.data %>%
+    group_by(sample, treatment, seurat_clusters) %>%
+    summarise(n = n()) %>%
+    mutate(percentage = (n / sum(n)) * 100) %>%
+    ggplot(., aes(x = seurat_clusters, y = percentage, fill = seurat_clusters)) +
+    geom_bar(stat = "identity", width = 0.25) +
+    facet_grid(~ sample + treatment) +
+    scale_fill_manual(values = viridis_pal(option = "H")(5)) +
+    geom_text(aes(label = round(percentage, 2)), vjust = -0.5, size = 3) +
+    ylim(c(0, 100)) +
+    theme_classic()
+}
+
+wrap_plots(clustercountsplots) + plot_layout(ncol = 1)
+
+rm(clustercountsplots, i)
+```
+
+# Differential Expression Testing {.tabset .tabset-fade .tabset-pills}
+The **goal** of this part of the analysis is to identify "significant" genes specific to a cluster and subsequently identify which pathways these genes belong to. Within the Chien Lab, we are usually only interested in the markers between two groups &#8594; the tagged vs the phototagged group, which is why we will use the `FindMarkers` function.
+
+<details>
+  <summary>Settings and output of `FindMarkers`</summary>
+The most important settings of this function are: <br>
+- `slot` &#8594; which data slot of the active assay will be used. The default is the `data` slot which contains the normalized data <br>
+- `logfc.threshold` &#8594; only genes which show this amount of difference will be tested <br>
+- `test.use` &#8594; which statistical test to use, the default is Wilcoxon rank sum test <br>
+- `min.pct` &#8594; only genes which are detected in at least this fraction between the two groups will be tested <br>
+- `ident.1` and `ident.2` &#8594; which two groups to compare; the names of the levels of the Seurat object <br>
+
+The output contains: <br>
+- `avg_logFC` &#8594; the log2 fold change between the two groups. Positive values mean overexpression in the first group <br>
+- `p_val_adj` &#8594; the Bonferroni corrected genes <br>
+</details> 
+
+First we need to specify the `Idents` of the groups we want to compare and set the cutoffs we want to use for significant genes. Based on various discussions in the Seurat GitHub page it is still recommended to use the `RNA` assay rather than the `SCT` assay for the marker identification.
+```{r}
+IDENT_TO_USE <- "treatment" # Which meta.data column to use; comment this out if you do not want to change it
+IDENT_NAMES <- c("outer", "inner") # The names of the two groups to compare
+
+# Cutoffs used for "significant markers" selection
+CUTOFF_FC <- 0.1
+CUTOFF_PVAL <- 1e-5
+
+# Change the default assay and set the Idents
+markers_object <- corrected_object
+
+if (exists("IDENT_TO_USE")) {
+  for (i in names(markers_object)) {
+    print(paste(i, "| Changing the idents to", IDENT_TO_USE, sep = " "))
+    Idents(markers_object[[i]]) <- markers_object[[i]]@meta.data[[IDENT_TO_USE]]
+    DefaultAssay(markers_object[[i]]) <- "RNA"
+    print(levels(markers_object[[i]]))
+    rm(i)
+  }
+} else {
+  print("Previous Idents will be used for marker identification")
+  for (i in names(markers_object)) {
+    print(i)
+    DefaultAssay(markers_object[[i]]) <- "RNA"
+    print(levels(markers_object[[i]]))
+    rm(i)
+  }
+}
+```
+
+## Identify the marker genes
+```{r}
+find_markers <- function(data) {
+  # Function to run FindMarkers from Seurat and add some additional columns to results
+  ## Uses the ident order specified in IDENT_NAMES
+
+  result <- FindMarkers(data,
+    ident.1 = IDENT_NAMES[[1]], ident.2 = IDENT_NAMES[[2]],
+    min.pct = 0, logfc.threshold = 0, verbose = FALSE
+  )
+
+  # Add additional columns to the output
+  output <- result %>%
+    rownames_to_column(., "gene") %>%
+    mutate(significance = ifelse(p_val_adj < CUTOFF_PVAL & (avg_log2FC <= -CUTOFF_FC | avg_log2FC >= CUTOFF_FC),
+      "significant", "not significant"
+    )) %>%
+    mutate(logP_val = -log10(p_val)) %>%
+    mutate(logP_val_adj = -log10(p_val_adj)) %>%
+    mutate(typeRegulation = ifelse(avg_log2FC < 0, "down", "up")) %>%
+    arrange(desc(p_val_adj))
+
+  return(output)
+}
+
+# Identify DEGS ------------------------------------------------------------------------------------
+# allMarkersList <- list()
+# 
+# for (i in names(markers_object)) {
+#   output <- find_markers(markers_object[[i]])
+# 
+#   # Add to the allmarkers list
+#   allMarkersList[[i]] <- output
+# 
+#   # Save to a file
+#   write.table(
+#     output,
+#     file = paste0(genesDirectory, PROJECTNAME, "_", ANALYSISNAME, "_Allmarkers", ".csv"),
+#     quote = FALSE, sep = ",", row.names = FALSE
+#   )
+# 
+#   rm(output)
+# }
+# 
+# rm(i)
+
+# Or import from a previous analysis ---------------------------------------------------------------
+allMarkersList <- list()
+
+for (i in names(corrected_object)){
+  allMarkersList[[i]] <- read.csv(paste0(genesDirectory, PROJECTNAME, "_", ANALYSISNAME, "_Allmarkers.csv"))
+}
+```
+
+## Volcano plots
+```{r fig.width=3.5, fig.height=4}
+volcano_plot <- function(data, patient) {
+  ### Function to plot a Volcano plot from the markergenes
+  outputdata <- data[[patient]]
+
+  volcano_labels <- c("ANXA5", "LAMB1", "SNAI2", "TGFB1", "NRP1", "VIM", "CD24", "CDH1", "DSC2", "EPCAM", "METTL7A")
+
+  plot <- EnhancedVolcano(outputdata,
+    lab = outputdata$gene,
+    x = "avg_log2FC",
+    y = "p_val",
+    pCutoffCol = "p_val_adj",
+    pCutoff = CUTOFF_PVAL,
+    FCcutoff = CUTOFF_FC,
+    xlim = c(-1.5, 1.5),
+    selectLab = volcano_labels,
+    # text
+    title = "",
+    subtitle = "",
+    caption = "",
+    # styling
+    col = c("#b3b6b7", "#b3b6b7", "#b3b6b7", colorpalette[9]), # "#b3b6b7"
+    colAlpha = 0.8,
+    legendPosition = "none",
+    gridlines.major = F,
+    gridlines.minor = F,
+    drawConnectors = T,
+    boxedLabels = T,
+    arrowheads = T,
+    ## font and shape sizes
+    pointSize = 1,
+    labSize = 2,
+    axisLabSize = 8,
+    titleLabSize = 0,
+    subtitleLabSize = 0,
+    captionLabSize = 0
+  )
+
+  return(plot)
+}
+
+# PLOT volcano -------------------------------------------------------------------------------------
+volcanoplots <- list()
+
+for (i in names(allMarkersList)) {
+  volcanoplots[[i]] <- volcano_plot(allMarkersList, patient = i)
+}
+
+volcanoplots[[i]]
+
+# wrap_plots(volcanoplots) + plot_layout(guides = "collect")
+
+# Uncomment if you want to save the plot
+# ggsave(
+#     filename = paste0(PROJECTNAME, "_", ANALYSISNAME, "_DEG_volcano", ".pdf"),
+#     plot = volcanoplots[[i]],
+#     path = imageDirectory,
+#     width = 3.5,
+#     height = 4,
+#     #units = "in",
+#   )
+
+rm(volcanoplots)
+```
+
+## Presto genes
+For the ranking of the genes we use the [presto package](https://github.com/immunogenomics/presto). The ranking is performed on the entire Seurat object
+```{r}
+for (i in names(markers_object)) {
+  output <- wilcoxauc(markers_object[[i]], "treatment") %>%
+    filter(group == "inner")
+
+  # Save to a file
+  write.table(
+    output,
+    file = paste0(genesDirectory, PROJECTNAME, "_", ANALYSISNAME, "_PRESTOmarkers_inner", ".csv"),
+    quote = FALSE,
+    sep = ",",
+    row.names = FALSE
+  )
+
+  gsearanks <- output %>%
+    arrange(desc(auc)) %>%
+    select(feature, auc)
+
+  # Save to a file
+  write.table(
+    gsearanks,
+    paste0(gseaDirectory, PROJECTNAME, "_", ANALYSISNAME, "_GSEA_inner.rnk"),
+    sep = "\t",
+    row.names = FALSE,
+    col.names = TRUE,
+    quote = FALSE
+  )
+
+  rm(output, gsearanks)
+
+  # rm(output)
+}
+
+rm(i)
+```
+
+# Additional plotting
+## Gene expression Violin plots 
+Violin plots for epithelial and mesenchymal genes
+```{r fig.height = 1.8, fig.width = 1.6}
+gexp_data <- FetchData(corrected_object[[i]], vars = c("treatment", "CDH1", "EPCAM", "VIM", "FN1"))
+genestoplot <- c("CDH1", "EPCAM", "VIM", "FN1")
+
+gexp_violins <- list()
+
+for (j in genestoplot) {
+  gexp_violins[[j]] <- VlnPlot(
+    corrected_object[[i]],
+    features = j,
+    group.by = "treatment",
+    cols = colorbytreatment,
+    assay = "RNA",
+    pt.size = 0
+  ) +
+    stat_summary(fun.y = median, geom = "point", size = 0.5, colour = "black") +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(face = "plain", size = 9),
+      axis.title = element_text(size = 9),
+      axis.text = element_text(size = 8)
+    )
+  #
+  #   ggsave(
+  #     filename = paste0(PROJECTNAME, "_", ANALYSISNAME, "_gEXP_", j , ".pdf"),
+  #     plot = gexp_violins[[j]],
+  #     path = imageDirectory,
+  #     width = 1.6,
+  #     height = 1.8
+  #     )
+}
+
+gexp_violins
+```
+
+## Violin plots for in the Supplements
+```{r fig.width= 7, fig.height=6}
+VlnPlot(
+  corrected_object[[i]],
+  features = c("VEGFA", "VEGFB", "VEGFC", "NRP1", "NRP2"),
+  group.by = "treatment",
+  cols = colorbytreatment,
+  assay = "RNA",
+  pt.size = 0
+) +
+  theme(legend.position = "none")
+
+# ggsave(filename = paste0(PROJECTNAME, "_", ANALYSISNAME, "_VEGF_plots", ".pdf"),
+#     plot = last_plot(),
+#     path = imageDirectory)
+
+VlnPlot(
+  corrected_object[[i]],
+  features = c("EPHA2", "EPHB2", "EPHB3", "EPHB4", "EPHB6", "EFNA1", "EFNA3", "EFNA5", "EFNB1", "EFNB2"),
+  group.by = "treatment",
+  cols = colorbytreatment,
+  assay = "RNA",
+  pt.size = 0
+) +
+  theme(legend.position = "none")
+
+# ggsave(filename = paste0(PROJECTNAME, "_", ANALYSISNAME, "_Ephrin_plots", ".pdf"),
+#     plot = last_plot(),
+#     path = imageDirectory,
+#     width = 7,
+#     height = 8)
+```
+
+# Save the Seurat object
+```{r}
+# saveRDS(corrected_object, file = paste0(dataDirectory, PROJECTNAME, "_", ANALYSISNAME, "_CorrectedObject.rds"))
+```
+
+<details>
+  <summary>Session information</summary>
+```{r}
+devtools::session_info()
+```
+</details> 
