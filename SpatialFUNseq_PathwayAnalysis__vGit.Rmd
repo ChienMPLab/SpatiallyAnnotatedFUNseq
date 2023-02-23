@@ -1,0 +1,868 @@
+---
+title: "MPChien Lab scRNAseq pipeline code | Pathway Analysis"
+author: "Kate J. Feller & Myrthe Smit"
+output:
+  html_document:
+    highlight: pygments
+    df_print: paged
+    toc: yes
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+# Erase everything in the global environment
+# It is a good habit to start with a clean slate
+rm(list = ls())
+
+# Set the knitr options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  error = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = TRUE,
+  results = "hold",
+  fig.keep = "all",
+  fig.show = "hold",
+  comment = NA
+)
+```
+
+<span style="color:#cd6155;">**Libraries**</span> <br>
+For this analysis we will use the packages:<br>
+- [clusterProfiler](http://yulab-smu.top/clusterProfiler-book/index.html)
+- [msigdbr](https://cran.r-project.org/web/packages/msigdbr/vignettes/msigdbr-intro.html) to retrieve the reference database <br>
+- [fgsea](https://github.com/ctlab/fgsea) to perform GSEA
+
+```{r libraries}
+library(clusterProfiler)
+library(ComplexHeatmap)
+library(enrichplot)
+library(fgsea)
+library(future)
+library(GSVA)
+library(msigdbr)
+library(patchwork)
+library(Seurat)
+library(tidyverse)
+library(viridis)
+
+# Set the amount of cores to use
+plan("multiprocess", workers = 5)
+# Specify the amount of memory to use (in mbs)
+MEMORY <- 700
+options(future.globals.maxSize = MEMORY * (1024^2))
+
+rm(MEMORY)
+```
+
+# The Experimental Information
+<span style="color:#cd6155;">**scRNAseq_analysis_code version**</span> v5.1
+
+<span style="color:#cd6155;">**Experimental Code**</span> <br>
+MS011
+
+<span style="color:#cd6155;">**Description of the wet lab experiment and the data**</span> <br>
+In this experiment we seeded a patch of MCF10A cells and let them grow for 6 days. Then we phototagged cells with two different phototagging dyes to get 3 regions: the outside ring of the clump, the middle ring of the clump and the center. In one set-up, we made equally-sized rings and in the other set-up we made rings with width 250 um. 
+
+<span style="color:#cd6155;">**Goal of this analysis **</span> <br>
+Test if the cells at the edge have a higher level of EMT than cells in the center. In this code we will check which pathways are upregulated
+
+<span style="color:#cd6155;">**Sample description**</span> <br>
+```{r experiments, echo=FALSE}
+# Read in the Excel file with the sample information
+sampleinformation <- readxl::read_excel("2_scData/SampleOverview.xlsx")
+
+# Format the table
+formattable::formattable(sampleinformation, align = c("l"))
+rm(sampleinformation)
+```
+
+# The Basis | Directories and Data
+## Directories and project name
+```{r}
+# Where to read the scRNAseq data from
+dataDirectory <- "2_scData/"
+genesDirectory <- "3_GenesofInterest/"
+gseaDirectory <- "4_GSEA/"
+oraDirectory <- "5_ORA/"
+imageDirectory <- "_Figures"
+
+colorpalette <- viridis_pal(option = "magma")(12)
+colorbytreatment <- list("inner" = colorpalette[[11]], "middle" = colorpalette[[8]], "outer" = colorpalette[[3]])
+
+
+# These names will be used in file saving and loading
+# PROJECTNAME <- "MS_SpatialTranscriptomics"
+PROJECTNAME <- "MS011"
+ANALYSISNAME <- "edge"
+
+CUTOFF_FC <- 0.1
+CUTOFF_PVAL <- 1e-5
+colorpalette <- viridis_pal(option = "magma")(12)
+```
+
+## Reading in the significant genes {.tabset .tabset-fade .tabset-pills}
+### Seurat data
+We will select the top_n genes of all Seurat marker genes
+```{r}
+seuratmarkers <- list()
+
+for (i in c("MS011")) {
+  seuratmarkers[[i]] <- read.csv(paste0(genesDirectory, PROJECTNAME, "_", ANALYSISNAME, "_Allmarkers.csv"))
+}
+
+rm(i)
+```
+
+Next, we will filter out the upregulated significant genes.
+```{r}
+seurat_UP <- list()
+
+for (i in names(seuratmarkers)) {
+  seurat_UP[[i]] <- seuratmarkers[[i]] %>%
+    filter(p_val_adj < CUTOFF_PVAL & avg_log2FC >= CUTOFF_FC) %>%
+    .$gene
+
+  seurat_UP[[i]] <- sort(seurat_UP[[i]])
+}
+
+# write.table(
+#   seurat_UP,
+#   paste0(genesDirectory, PROJECTNAME, "_", ANALYSISNAME, "_SeuratUP.txt"),
+#   sep = "\t",
+#   row.names = FALSE,
+#   col.names = FALSE,
+#   quote = FALSE
+# )
+
+# seurat_UP
+```
+
+```{r}
+seurat_DOWN <- list()
+
+for (i in names(seuratmarkers)) {
+  seurat_DOWN[[i]] <- seuratmarkers[[i]] %>%
+    filter(p_val_adj < CUTOFF_PVAL & avg_log2FC <= -CUTOFF_FC) %>%
+    .$gene
+
+  seurat_DOWN[[i]] <- sort(seurat_DOWN[[i]])
+}
+
+# write.table(
+#   seurat_DOWN,
+#   paste0(genesDirectory, PROJECTNAME, "_", ANALYSISNAME, "_SeuratDOWN.txt"),
+#   sep = "\t",
+#   row.names = FALSE,
+#   col.names = FALSE,
+#   quote = FALSE
+# )
+
+# seurat_DOWN
+```
+
+### Presto data
+The significant genes
+```{r}
+prestomarkers <- list()
+prestomarkers_inner <- list()
+
+for (i in c("MS011")) {
+  prestomarkers[[i]] <- read.csv(paste0(genesDirectory, PROJECTNAME, "_", ANALYSISNAME, "_PRESTOmarkers.csv"))
+  prestomarkers_inner[[i]] <- read.csv(paste0(genesDirectory, PROJECTNAME, "_", ANALYSISNAME, "_PRESTOmarkers_inner.csv"))
+}
+
+rm(i)
+```
+
+Next, we will filter out the upregulated significant genes.
+```{r}
+presto_UP <- list()
+
+for (i in names(prestomarkers)) {
+  presto_UP[[i]] <- prestomarkers[[i]] %>%
+    filter(padj < CUTOFF_PVAL & logFC >= CUTOFF_FC) %>%
+    .$feature
+}
+
+# Save to a file
+# write.table(
+#   flatten_chr(presto_UP),
+#   paste0(genesDirectory, PROJECTNAME, "_", ANALYSISNAME, "_PrestoSignUP.txt"),
+#   sep = "\t",
+#   row.names = FALSE, col.names = FALSE, quote = FALSE
+# )
+
+# presto_UP
+```
+
+Here, we will filter out the downregulated significant genes
+```{r}
+presto_DOWN <- list()
+
+for (i in names(prestomarkers)) {
+  presto_DOWN[[i]] <- prestomarkers[[i]] %>%
+    filter(padj < CUTOFF_PVAL & logFC <= -CUTOFF_FC) %>%
+    .$feature
+}
+
+# # Save to a file
+# write.table(
+#   flatten_chr(presto_DOWN),
+#   paste0(genesDirectory, PROJECTNAME, "_", ANALYSISNAME, "_PrestoSignDOWN.txt"),
+#   sep = "\t",
+#   row.names = FALSE,
+#   col.names = FALSE,
+#   quote = FALSE
+# )
+# 
+# presto_DOWN
+```
+
+Finally, we will create the ranked data for GSEA
+```{r}
+presto_GSEA <- list()
+presto_GSEA_inner <- list()
+
+for (i in names(prestomarkers)) {
+  output <- prestomarkers[[i]] %>%
+    arrange(desc(auc)) %>%
+    select(feature, auc)
+
+  presto_GSEA[[i]] <- deframe(output)
+
+  rm(output)
+}
+
+for (i in names(prestomarkers_inner)) {
+  output <- prestomarkers_inner[[i]] %>%
+    arrange(desc(auc)) %>%
+    select(feature, auc)
+
+  presto_GSEA_inner[[i]] <- deframe(output)
+
+  rm(output)
+}
+
+rm(i)
+```
+
+# Overrepresentation Analysis (ORA)
+<span style="color:#cd6155;">**Overrepresentation analysis (ORA) **</span> tests whether a gene list contains a disproportionate amount of genes with differential expression. For this analysis we only need the significantly regulated genes. We will use the WikiPathways database for this analysis extracted from [MSigDB](https://www.gsea-msigdb.org/gsea/msigdb/index.jsp).
+
+<details>
+  <summary>Available MSigDB gene sets</summary>
+```{r}
+msigdbr_collections()
+```
+</details> 
+
+```{r}
+# Extract the gene sets
+database_ORA_wiki <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:WIKIPATHWAYS") %>% select(gs_name, gene_symbol)
+database_ORA_h <- msigdbr(species = "Homo sapiens", category = "H") %>% select(gs_name, gene_symbol)
+database_ORA_GO <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP") %>% select(gs_name, gene_symbol)
+database_ORA_KEGG <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG") %>% select(gs_name, gene_symbol)
+```
+
+<details>
+  <summary>Function for plotting ORA plots</summary>
+```{r}
+plotORA <- function(pathwaytable, categories = 10) {
+  # Function to plot an ORA barplot
+  # Input :
+  # - pathwaytable <- a pathway table output from clusterprofiler::enricher
+  # - categories <- how many pathways to plot
+
+  barplot(pathwaytable, showCategory = categories, color = "qvalue") +
+    scale_fill_viridis(option = "D", limits = c(0, 0.05)) +
+    theme(
+      axis.text.x = element_text(size = 8),
+      axis.text.y = element_text(size = 8)
+    )
+}
+```
+</details>
+
+## Seurat {.tabset .tabset-fade .tabset-pills}
+### Seurat upregulated genes | WIKI
+```{r}
+seurat_ORA_UP <- enricher(flatten_chr(seurat_UP), TERM2GENE = database_ORA_wiki)
+head(seurat_ORA_UP)
+plotORA(seurat_ORA_UP)
+
+# write.table(seurat_ORA_UP,
+#   file = paste0(oraDirectory, PROJECTNAME, "_seurat_ORA_UP", ".csv"),
+#   quote = FALSE,
+#   sep = ",",
+#   row.names = FALSE
+# )
+rm(seurat_ORA_UP)
+```
+
+### Seurat upregulated genes | Hallmarks
+```{r}
+seurat_ORA_UP <- enricher(flatten_chr(seurat_UP), TERM2GENE = database_ORA_h)
+head(seurat_ORA_UP)
+plotORA(seurat_ORA_UP)
+
+rm(seurat_ORA_UP)
+```
+
+### Seurat upregulated genes | GO
+```{r}
+seurat_ORA_UP <- enricher(flatten_chr(seurat_UP), TERM2GENE = database_ORA_GO)
+head(seurat_ORA_UP)
+plotORA(seurat_ORA_UP)
+
+# write.table(
+#   eurat_ORA_UP,
+#   file = paste0(oraDirectory, PROJECTNAME, "_seurat_ORA_UP", ".csv"),
+#   quote = FALSE,
+#   sep = ",",
+#   row.names = FALSE
+# )
+
+rm(seurat_ORA_UP)
+```
+
+### Seurat upregulated genes | KEGG
+```{r}
+seurat_ORA_UP <- enricher(flatten_chr(seurat_UP), TERM2GENE = database_ORA_KEGG)
+head(seurat_ORA_UP)
+plotORA(seurat_ORA_UP)
+
+# write.table(
+#   seurat_ORA_UP,
+#   file = paste0(oraDirectory, PROJECTNAME, "_seurat_ORA_UP", ".csv"),
+#   quote = FALSE,
+#   sep = ",",
+#   row.names = FALSE
+# )
+
+rm(seurat_ORA_UP)
+```
+
+### Seurat downregulated genes | Wiki
+```{r}
+seurat_ORA_DOWN <- enricher(flatten_chr(seurat_DOWN), TERM2GENE = database_ORA_wiki)
+head(seurat_ORA_DOWN)
+plotORA(seurat_ORA_DOWN)
+
+rm(seurat_ORA_DOWN)
+```
+
+### Seurat downregulated genes | Hallmarks
+```{r}
+seurat_ORA_DOWN <- enricher(flatten_chr(seurat_DOWN), TERM2GENE = database_ORA_h)
+head(seurat_ORA_DOWN)
+plotORA(seurat_ORA_DOWN)
+
+rm(seurat_ORA_DOWN)
+```
+
+### Seurat downregulated genes | GO Biological processes
+```{r}
+seurat_ORA_DOWN <- enricher(flatten_chr(seurat_DOWN), TERM2GENE = database_ORA_GO)
+head(seurat_ORA_DOWN)
+plotORA(seurat_ORA_DOWN)
+
+rm(seurat_ORA_DOWN)
+```
+
+### Seurat downregulated genes | KEGG
+```{r}
+seurat_ORA_DOWN <- enricher(flatten_chr(seurat_DOWN), TERM2GENE = database_ORA_KEGG)
+head(seurat_ORA_DOWN)
+plotORA(seurat_ORA_DOWN)
+
+rm(seurat_ORA_DOWN)
+```
+
+## PRESTO {.tabset .tabset-fade .tabset-pills}
+### Presto upregulated genes | WIKI
+```{r}
+presto_ORA_UP <- enricher(flatten_chr(presto_UP), TERM2GENE = database_ORA_wiki)
+head(presto_ORA_UP)
+plotORA(presto_ORA_UP)
+
+# write.table(
+#   presto_ORA_UP,
+#   file = paste0(oraDirectory, PROJECTNAME, "_presto_ORA_UP", ".csv"),
+#   quote = FALSE,
+#   sep = ",",
+#   row.names = FALSE
+# )
+
+rm(presto_ORA_UP)
+```
+
+### Presto upregulated genes | Hallmarks
+```{r}
+presto_ORA_UP <- enricher(flatten_chr(presto_UP), TERM2GENE = database_ORA_h)
+head(presto_ORA_UP)
+plotORA(presto_ORA_UP)
+
+rm(presto_ORA_UP)
+```
+
+### Presto downregulated genes | WIKI
+```{r}
+presto_ORA_DOWN <- enricher(flatten_chr(presto_DOWN), TERM2GENE = database_ORA_wiki)
+head(presto_ORA_DOWN)
+# plotORA(presto_ORA_DOWN)
+
+rm(presto_ORA_DOWN)
+```
+
+### Presto downregulated genes | Hallmark
+```{r}
+presto_ORA_DOWN <- enricher(flatten_chr(presto_DOWN), TERM2GENE = database_ORA_h)
+head(presto_ORA_DOWN)
+# plotORA(presto_ORA_DOWN)
+
+rm(presto_ORA_DOWN)
+```
+
+# GSEA analysis | Hallmark Database {.tabset .tabset-fade .tabset-pills}
+<span style="color:#cd6155;">**Gene Set Enrichment Analysis (GSEA) **</span> tests whether genes of a gene set accumulate at the top or bottom of an ordered gene set. <span style="color:#cd6155;">**For this analysis we will use the**</span> &#8594; Hallmark Gene Set database from the MSigDB database.
+
+```{r}
+database_GSEA_hallmark <- msigdbr(species = "Homo sapiens", category = "H", subcategory = NULL)
+database_GSEA_wiki <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:WIKIPATHWAYS")
+database_GSEA_GO <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP")
+database_GSEA_KEGG <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG")
+```
+
+<details>
+  <summary>Function for plotting GSEA plots</summary>
+```{r}
+plotGSEA <- function(gseaoutput, saveheatmapdata = F, filename = "GSEA_data") {
+  # Function to plot an GSEA heatmap
+  # Input :
+  # - gseaoutput <- the modified output from fgsea
+  # - saveheatmapdata <- boolean to save the
+  # - filename <- saveheatmapdata file name
+
+  # Filter out the positive pathways
+  positive_pathways <- list()
+
+  for (i in names(gseaoutput)) {
+    positive_pathways[[i]] <- gseaoutput[[i]] %>%
+      filter(NES > 0) %>%
+      .$renamed_pathway
+  }
+  positive_matrix <- list_to_matrix(positive_pathways)
+
+  # Filter out the negative pathways
+  negative_pathways <- list()
+  for (j in names(gseaoutput)) {
+    negative_pathways[[j]] <- gseaoutput[[j]] %>%
+      filter(NES < 0) %>%
+      .$renamed_pathway
+  }
+  negative_matrix <- list_to_matrix(negative_pathways) * -1
+
+  # Combine the lists into a matrix
+  heatmapdata <- rbind(positive_matrix, negative_matrix)
+  heatmapdata <- rowsum(heatmapdata, row.names(heatmapdata)) # aggregate rows with the same name
+  heatmapdata <- heatmapdata[order(rowSums(heatmapdata), decreasing = T), ] # sort based on presence in all samples
+
+  # Plot
+  heatmapplot <- Heatmap(
+    heatmapdata,
+    col = structure(c("#45b39d", "#bbdefb", "#f4f6f6", "#ef9a9a"), names = c("-2", "-1", "0", "1")),
+    rect_gp = gpar(col = "white", lwd = 2),
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    row_names_gp = grid::gpar(fontsize = 8),
+    column_names_gp = grid::gpar(fontsize = 8),
+    column_names_rot = 45,
+    heatmap_legend_param = list(
+      title = "",
+      at = c("-1", "0", "1"),
+      labels = c("down-regulated", "not present", "up-regulated")
+    )
+  )
+  
+  if (saveheatmapdata) {
+    write.table(
+      heatmapdata,
+      file = paste0(gseaDirectory, PROJECTNAME, "_", ANALYSISNAME, "_", filename, ".csv"),
+      quote = FALSE,
+      sep = ",",
+      row.names = T
+    )
+  }
+  
+  return (heatmapplot)
+}
+```
+</details>
+
+## GSEA | Hallmark
+```{r}
+# Create the correct input for the `fgsea` package
+fgsea_GSEA_input <- database_GSEA_hallmark %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+results_GSEA <- list()
+
+for (i in names(presto_GSEA)) {
+  results_GSEA[[i]] <- fgsea(fgsea_GSEA_input, stats = presto_GSEA[[i]]) %>%
+    filter(padj < CUTOFF_PVAL) %>%
+    mutate(renamed_pathway = str_remove(pathway, "HALLMARKS_"))
+}
+
+draw(plotGSEA(results_GSEA))
+
+rm(i, fgsea_GSEA_input, results_GSEA)
+```
+
+## GSEA | Wikipathways
+```{r}
+# Create the correct input for the `fgsea` package
+fgsea_GSEA_input <- database_GSEA_wiki %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+results_GSEA <- list()
+
+for (i in names(presto_GSEA)) {
+  results_GSEA[[i]] <- fgsea(fgsea_GSEA_input, stats = presto_GSEA[[i]]) %>%
+    filter(padj < CUTOFF_PVAL) %>%
+    mutate(renamed_pathway = str_remove(pathway, "WP_"))
+}
+
+draw(plotGSEA(results_GSEA))
+
+rm(i , fgsea_GSEA_input, results_GSEA)
+```
+
+## GSEA | GO:BP
+```{r}
+# Create the correct input for the `fgsea` package
+fgsea_GSEA_input <- database_GSEA_GO %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+results_GSEA <- list()
+
+for (i in names(presto_GSEA)) {
+  results_GSEA[[i]] <- fgsea(fgsea_GSEA_input, stats = presto_GSEA[[i]], eps = 1e-30) %>%
+    filter(padj < 1e-25) %>%
+    mutate(renamed_pathway = str_remove(pathway, "GO_"))
+}
+
+draw(plotGSEA(results_GSEA))
+
+rm(i, fgsea_GSEA_input, results_GSEA)
+```
+
+## GSEA | KEGG
+```{r}
+# Create the correct input for the `fgsea` package
+fgsea_GSEA_input <- database_GSEA_KEGG %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+results_GSEA <- list()
+
+for (i in names(presto_GSEA)) {
+  results_GSEA[[i]] <- fgsea(fgsea_GSEA_input, stats = presto_GSEA[[i]], eps = 1e-10) %>%
+    filter(padj < CUTOFF_PVAL) %>%
+    mutate(renamed_pathway = str_remove(pathway, "GO_"))
+}
+
+draw(plotGSEA(results_GSEA))
+
+rm(i, fgsea_GSEA_input, results_GSEA)
+```
+
+# GSEA analysis INNER POPULATION {.tabset .tabset-fade .tabset-pills}
+<span style="color:#cd6155;">**Gene Set Enrichment Analysis (GSEA) **</span> tests whether genes of a gene set accumulate at the top or bottom of an ordered gene set. <span style="color:#cd6155;">**For this analysis we will use the**</span> &#8594; Hallmark Gene Set database from the MSigDB database.
+```{r}
+database_GSEA_hallmark <- msigdbr(species = "Homo sapiens", category = "H", subcategory = NULL)
+database_GSEA_wiki <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:WIKIPATHWAYS")
+database_GSEA_GO <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP")
+database_GSEA_KEGG <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG")
+```
+
+```{r}
+# Create the correct input for the `fgsea` package
+fgsea_GSEA_input <- database_GSEA_hallmark %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+results_GSEA <- list()
+
+for (i in names(presto_GSEA_inner)) {
+  results_GSEA[[i]] <- fgsea(fgsea_GSEA_input, stats = presto_GSEA_inner[[i]]) %>%
+    filter(padj < CUTOFF_PVAL) %>%
+    mutate(renamed_pathway = str_remove(pathway, "HALLMARKS_"))
+}
+
+draw(plotGSEA(results_GSEA))
+
+rm(i, database_GSEA_hallmark, fgsea_GSEA_input, results_GSEA)
+```
+
+## GSEA INNER | Wikipathways
+```{r}
+# Create the correct input for the `fgsea` package
+fgsea_GSEA_input <- database_GSEA_wiki %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+results_GSEA <- list()
+
+for (i in names(presto_GSEA_inner)) {
+  results_GSEA[[i]] <- fgsea(fgsea_GSEA_input, stats = presto_GSEA_inner[[i]]) %>%
+    filter(padj < CUTOFF_PVAL) %>%
+    mutate(renamed_pathway = str_remove(pathway, "WP_"))
+}
+
+draw(plotGSEA(results_GSEA))
+
+rm(i, database_GSEA_wiki, fgsea_GSEA_input, results_GSEA)
+```
+
+## GSEA INNER | GO:BP
+```{r}
+# Create the correct input for the `fgsea` package
+fgsea_GSEA_input <- database_GSEA_GO %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+results_GSEA <- list()
+
+for (i in names(presto_GSEA_inner)) {
+  results_GSEA[[i]] <- fgsea(fgsea_GSEA_input, stats = presto_GSEA_inner[[i]], eps = 1e-25) %>%
+    filter(padj < 1e-20) %>%
+    mutate(renamed_pathway = str_remove(pathway, "GO_"))
+}
+
+draw(plotGSEA(results_GSEA))
+
+rm(i, fgsea_GSEA_input, results_GSEA)
+```
+
+## GSEA INNER | KEGG
+```{r}
+# Create the correct input for the `fgsea` package
+fgsea_GSEA_input <- database_GSEA_KEGG %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+results_GSEA <- list()
+
+for (i in names(presto_GSEA_inner)) {
+  results_GSEA[[i]] <- fgsea(fgsea_GSEA_input, stats = presto_GSEA_inner[[i]], eps = 1e-10) %>%
+    filter(padj < CUTOFF_PVAL) %>%
+    mutate(renamed_pathway = str_remove(pathway, "GO_"))
+}
+
+draw(plotGSEA(results_GSEA))
+
+rm(i, fgsea_GSEA_input, results_GSEA)
+```
+
+# GSVA analysis | Nanostring EMT genes
+Calculate EMT score for each cell
+```{r}
+# load gene sets
+epithelial <- readLines("EMT_nanostring_epithelial.csv")
+mesenchymal <- readLines("EMT_nanostring_mesenchymal.csv")
+genes <- list(genes_ep = epithelial, genes_mes = mesenchymal)
+
+# load data
+corrected_object <- readRDS(file = paste0(dataDirectory, PROJECTNAME, "_", ANALYSISNAME, "_CorrectedObject.rds"))
+
+seurat_data <- list()
+gsva_results <- list()
+emt_scores <- list()
+emt_scores2 <- list()
+treatments <- list()
+for (i in names(corrected_object)) {
+  # GSVA
+  seurat_data[[i]] <- GetAssayData(corrected_object[[i]], assay = "RNA", slot = "data")
+  gsva_results[[i]] <- as.data.frame(gsva(seurat_data[[i]], genes))
+
+  # EMT = M - E
+  # organize data so that we also know in which population each cell was
+  emt_scores[[i]] <- gsva_results[[i]]["genes_mes", ] - gsva_results[[i]]["genes_ep", ]
+  treatments[[i]] <- as.data.frame(corrected_object[[i]]@meta.data[["treatment"]])
+  emt_scores2[[i]] <- cbind(treatments[[i]], t(emt_scores[[i]]))
+}
+
+# organize data
+emt_scores <- do.call(rbind, emt_scores2)
+colnames(emt_scores) <- c("treatment", "emt_score")
+emt_scores$emt_score <- as.numeric(emt_scores$emt_score)
+emt_scores$treatment <- as.character(emt_scores$treatment)
+emt_scores <- as.data.frame(emt_scores)
+
+# add EMT scores to the Seurat object so that we can use them for downstream analysis
+for (i in names(corrected_object)) {
+  corrected_object[[i]] <- AddMetaData(corrected_object[[i]], metadata = emt_scores$emt_score, col.name = "EMT_score")
+}
+
+# saveRDS(corrected_object, file = paste0(dataDirectory, PROJECTNAME, "_", ANALYSISNAME, "_CorrectedObject.rds"))
+
+# organize data in a different way so that Kate can make boxplots in Prism
+emt_pre_prism <- cbind("cell" = rownames(emt_scores), emt_scores)
+emt_prism <- emt_pre_prism %>% pivot_wider(names_from = treatment, values_from = emt_score)
+# write.table(
+#   emt_prism,
+#   file = paste0(PROJECTNAME, "_", ANALYSISNAME, "_EMTscores", ".csv"),
+#   quote = FALSE,
+#   sep = ",",
+#   row.names = FALSE
+# )
+
+rm(emt_scores2, treatments, seurat_data)
+```
+
+Calculate statistics & visualize results
+```{r}
+emt_summary <- emt_scores %>%
+  group_by(treatment) %>%
+  summarise(
+    min = min(emt_score),
+    max = max(emt_score),
+    mean = mean(emt_score),
+    std = sd(emt_score),
+    med = median(emt_score),
+    iqr = IQR(emt_score),
+    n = n()
+  )
+
+# basic plots
+ggplot(emt_scores, aes(x = factor(treatment), y = emt_score)) +
+  geom_boxplot()
+
+ggplot(emt_scores, aes(emt_score)) +
+  geom_density(aes(fill = factor(treatment)), alpha = 0.6)
+```
+
+Color UMAP by EMT scores
+```{r fig.width=2.5, fig.height=2.5}
+# 2.5 #1.8
+umap_axis <- c(-6, 6)
+umapPlots <- list()
+umapPlots_EMT <- list()
+umapPlots_CDH1 <- list()
+umapPlots_VIM <- list()
+umapPlots_CC <- list()
+
+for (i in names(corrected_object)) {
+  # normal UMAP (colored by population) as a reference
+  umapPlots[[i]] <- DimPlot(corrected_object[[i]], reduction = "umap", group.by = "treatment", cols = colorbytreatment, pt.size = 0.07) +
+    theme(
+      axis.title = element_text(size = 9),
+      axis.text = element_text(size = 8),
+      legend.text = element_text(size = 8),
+      legend.position = "none"
+    ) +
+    scale_x_continuous(limits = umap_axis, breaks = c(-4, 0, 4)) +
+    scale_y_continuous(limits = umap_axis, breaks = c(-4, 0, 4))
+
+  # color UMAP by EMT scores
+  umapPlots_EMT[[i]] <- FeaturePlot(corrected_object[[i]], features = "EMT_score", pt.size = 0.07) +
+    theme(
+      axis.title = element_text(size = 9),
+      axis.text = element_text(size = 8),
+      legend.text = element_text(size = 8),
+      legend.position = "right"
+    ) +
+    scale_x_continuous(limits = umap_axis, breaks = c(-4, 0, 4)) +
+    scale_y_continuous(limits = umap_axis, breaks = c(-4, 0, 4)) +
+    # coord_cartesian(xlim = umap_axis, ylim = umap_axis) +
+    scale_color_viridis(option = "magma")
+
+  # Color UMAP by cell cycle
+  # umapPlots_CC[[i]] <-  DimPlot(corrected_object[[i]], reduction = "umap", group.by = "Phase", pt.size = 0.07) +
+  #  theme(axis.title = element_text(size = 12),
+  #         axis.text = element_text(size = 12),
+  #         legend.text = element_text(size = 12),
+  #         legend.position = "right" ) +
+  #   coord_cartesian(xlim = umap_axis, ylim = umap_axis)
+  #
+  # Color UMAP by CDH1 expression
+  # umapPlots_CDH1[[i]] <- FeaturePlot(corrected_object[[i]], features = "CDH1", pt.size = 0.07) +
+  #  theme(axis.title = element_text(size = 12),
+  #         axis.text = element_text(size = 12),
+  #         legend.text = element_text(size = 12),
+  #         legend.position = "right" ) +
+  #   coord_cartesian(xlim = umap_axis, ylim = umap_axis)
+  #
+  # Color UMAP by VIM expression
+  # umapPlots_VIM[[i]] <- FeaturePlot(corrected_object[[i]], features = "VIM", pt.size = 0.07) +
+  #  theme(axis.title = element_text(size = 12),
+  #         axis.text = element_text(size = 12),
+  #         legend.text = element_text(size = 12),
+  #         legend.position = "right" ) +
+  #   coord_cartesian(xlim = umap_axis, ylim = umap_axis)
+}
+
+umapPlots
+umapPlots_EMT
+# umapPlots_CC
+# umapPlots_CDH1
+# umapPlots_VIM
+
+# DO NOT RUN: save normal UMAP (already happened in the Analysis script)
+# ggsave(
+#     filename = paste0(PROJECTNAME, "_", ANALYSISNAME, "_UMAP", ".pdf"),
+#     plot = umapPlots[[i]],
+#     path = imageDirectory,
+#     dpi = 300,
+#     width = 1.8,
+#     height = 2.5,
+#     #units = "in",
+#   )
+
+# Save UMAP colored by EMT score
+# ggsave(
+#     filename = paste0(PROJECTNAME, "_", ANALYSISNAME, "_UMAP_EMT", ".pdf"),
+#     plot = umapPlots_EMT[[i]],
+#     path = imageDirectory,
+#     dpi = 300,
+#     width = 2.5,
+#     height = 2.5,
+#     #units = "in",
+#   )
+
+# ggsave(
+#     filename = paste0(PROJECTNAME, "_", ANALYSISNAME, "_UMAP_VIM", ".pdf"),
+#     plot = umapPlots_VIM[[i]],
+#     path = imageDirectory,
+#     dpi = 300,
+#     width = 4,
+#     height = 3,
+#     #units = "in",
+#   )
+#
+#
+# ggsave(
+#     filename = paste0(PROJECTNAME, "_", ANALYSISNAME, "_UMAP_CDH1", ".pdf"),
+#     plot = umapPlots_CDH1[[i]],
+#     path = imageDirectory,
+#     dpi = 300,
+#     width = 4,
+#     height = 3,
+#     #units = "in",
+#   )
+#
+# ggsave(
+#     filename = paste0(PROJECTNAME, "_", ANALYSISNAME, "_UMAP_CC", ".pdf"),
+#     plot = umapPlots_CC[[i]],
+#     path = imageDirectory,
+#     dpi = 300,
+#     width = 4,
+#     height = 3,
+#     #units = "in",
+#   )
+```
+
+<details>
+  <summary>Session information</summary>
+```{r}
+devtools::session_info()
+```
+</details> 
