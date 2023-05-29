@@ -1,5 +1,5 @@
 ---
-title: "MMPChien Lab scRNAseq pipeline code | Interaction Analysis"
+title: "MPChien Lab scRNAseq pipeline code | Interaction Analysis"
 author: "Myrthe Smit"
 output:
   html_document:
