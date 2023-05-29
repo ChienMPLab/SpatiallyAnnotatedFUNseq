@@ -84,7 +84,7 @@ PROJECTNAME <- "MS_SpatialTranscriptomics"
 ```
 
 ## Importing the data
-For this analysis we will use `TranscriptCounts.tsv` files received from [Single Cell Discoveries, Utrecht](https://www.scdiscoveries.com/) and these contain the Poisson corrected UMI counts.
+For this analysis we will use `TranscriptCounts.tsv` files, which contain the Poisson corrected UMI counts.
 
 ```{r}
 # Identify all "TranscriptCounts.tsv" files
