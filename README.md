@@ -1,4 +1,4 @@
-# Spatially Annotated Single-Cell Sequencing
+# Spatially Annotated Functional Single-Cell Sequencing (FUNseq)
 We previously described spatially annotated single-cell sequencing, a method to spatially profile intratumor heterogeneity with deep scRNA-seq and single-cell resolution. Here, we have deposited all scripts required for analyzing the scRNA-seq data obtained using spatially annotated single-cell sequencing. 
 
 
