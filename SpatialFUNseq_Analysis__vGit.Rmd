@@ -140,7 +140,7 @@ beforeQC_object[["percentRIBO"]] <- PercentageFeatureSet(beforeQC_object, patter
 Based on the QC plots we will decide where to place the cutoffs for low quality cells. Generally speaking, we decide the cutoffs based on two parameters &#8594; `percentMT` and `nFeature_RNA`. By iteratively changing these cutoffs and looking at the distribution of cells that are filtered out, you can decide the final cutoffs. In some cases, individual samples may require different cutoffs. It is important to not consider each of these QC measures by themselves as that may result in a warped view of the data.
 
 ```{r}
-MT_cutoff <- 40  #differs between sample types
+MT_cutoff <- 30  #differs between sample types
 nFeature_cutoff <- c(2000, 9000)
 ```
 
