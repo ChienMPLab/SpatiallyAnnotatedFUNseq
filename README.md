@@ -4,7 +4,7 @@ We previously described spatially annotated single-cell sequencing, a method to 
 
 More detailed information about the execution of the protocol and analysis of the results can be found in:
 
-Smit, M.M., Feller, K.J., You, L. and Chien, M.-P. (2023). Protocol for profiling intratumor heterogeneity using spatially annotated single  cell sequencing. STAR Protocols. 2023 (DOI: 10.1016/j.xpro.2023.102447)
+Smit, M.M., Feller, K.J., You, L. and Chien, M.-P. (2023). Protocol for profiling intratumor heterogeneity using spatially annotated single  cell sequencing. STAR Protocols. (DOI: 10.1016/j.xpro.2023.102447)
 
 For complete details on the application of this protocol, please refer to: 
 
