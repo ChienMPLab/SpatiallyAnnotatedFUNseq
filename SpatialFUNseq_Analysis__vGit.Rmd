@@ -30,7 +30,7 @@ knitr::opts_chunk$set(
 ```
 
 <span style="color:#cd6155;">**Libraries**</span> <br>
-The MP Chien scRNAseq pipeline is build around the [Seurat package](https://satijalab.org/) standard scRNAseq analysis pipeline.
+The MPChien Lab scRNAseq pipeline is built around the [Seurat package](https://satijalab.org/) standard scRNAseq analysis pipeline.
 ```{r libraries}
 # Seurat library
 library(Seurat)
